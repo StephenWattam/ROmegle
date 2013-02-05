@@ -214,7 +214,7 @@ class Omegle
     #
     # This drops out when no events are
     # available, and automatically polls for more
-    while (get_event) != nil
+    while (e = get_event) != nil
       yield e
       poll_events if @events.length == 0
     end
