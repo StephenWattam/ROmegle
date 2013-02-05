@@ -29,13 +29,36 @@ require 'net/http'
 require 'json'
 require 'thread'
 
-# Class for handling connections with omegle.
+##
+# Open, manage and use a Session with Omegle.
+#
+# This class is capable of supporting all Omegle features, except webcam support, and constitutes a fairly thin layer over Omegle's event system.
+# 
+# Each time the code interacts with Omegle's web services, it receives, and queues up, some events.  These events may then be accessed in a thread-safe manner using the various functions of the class.
+# These events are documented, but only loosely.  They fit into rough categories:
+# 
+# * General events: waiting, connected, gotMessage, strangerDisconnected, typing, stoppedTyping, recaptchaRequired, recaptchaRejected, count, antinudeBanned
+# * Spy Mode Events: spyMessage, spyTyping, spyStoppedTyping, spyDisconnected, question, error, commonLikes
+# 
+# You'll have to do some testing to verify the precise pattern you receive when doing things, as Omegle seem to change some of their events around from time to time.
 class Omegle
 
-  # Passed to omegle in every call
+  ##
+  # Passed to omegle in every call.
+  #
+  # By default the static headers simply set the referer.
   STATIC_HEADERS = {"referer" => "http://omegle.com"}
 
-  # Default options
+  ##
+  # Default options.  These run to:
+  # * :host --- String, the host to connect to (don't change from omegle.com unless you wish to defy their load balancer)
+  # * :question --- String, the question to ask in spy mode
+  # * :topics --- Array of Strings, the list of topics you're interested in for Omegle's topic matching
+  # * :answer --- Boolean, tell Omegle that you wish to be watched (i.e. take part in spy mode for someone else's question)
+  # * :headers --- Some HTTP headers to send with every call, handy for things like user agent spoofing.
+  #
+  # Setting :question, :topics, or :answer will set the 'mode' of the session, and will cause errors if two are
+  # set together.
   DEFAULT_OPTIONS = {:host     => 'omegle.com',
                      :question => nil,
                      :topics   => nil,
@@ -45,8 +68,8 @@ class Omegle
   # The ID of this session
   attr_accessor :id
 
-  # Establish connection here to the omegle host
-  # (ie. omegle.com or cardassia.omegle.com).
+  # Construct the Omegle object and set options 
+  # See #DEFAULT_OPTIONS for a list of valid options for the hash.
   def initialize(options = {})
     # mutex for multiple access to send/events
     @mx = Mutex.new
@@ -59,8 +82,22 @@ class Omegle
     @events = []
   end
 
-  # Static method that will handle connecting/disconnecting to
-  # a person on omegle. Same options as constructor.
+  # :category: Control
+  #
+  # Static construct/use method.
+  #
+  # The code below:
+  #
+  #  Omegle.start(options){
+  #     whatever
+  #  }
+  #
+  # is equivalent to calling
+  #  o = Omegle.new(options)
+  #  o.start
+  #  whatever
+  #  o.disconnect
+  #
   def self.start(options = {})
     s = Omegle.new(options)
     s.start
@@ -68,7 +105,12 @@ class Omegle
     s.disconnect
   end
 
-  # Make a GET request to <omegle url>/start to get an id.
+  # :category: Control
+  #
+  # Make the initial request to omegle to start the session.
+  #
+  # This will, like all other calls to Omegle, cause some events to pile up.
+  # See #DEFAULT_OPTIONS for a list of valid options for the hash.
   def start(options = {})
     integrate_configs(options)
     
@@ -99,48 +141,70 @@ class Omegle
     end
   end
 
-  # POST to <omegle url>/events to get events from Stranger.
+  # :category: Control
+  #
+  # Check omegle to see if any events have come through.
   def poll_events
     ret = req('events', "id=#{@id}")
     parse_response(ret)
   end
 
-  # Send a message to the Stranger with id = @id.
+  # :category: Control
+  #
+  # Send a message to whoever is connected (if, indeed, they are)
   def send(msg)
-    t = Time.now
     ret = req('send', "id=#{@id}&msg=#{URI::encode(msg)}")
     parse_response(ret)
   end
 
+  # :category: Control
+  #
   # Let them know you're typing.
   def typing
     ret = req('typing', "id=#{@id}")
     parse_response(ret)
   end
 
-  # Disconnect from Stranger
+  # :category: Control
+  #
+  # Disconnect from Omegle.
+  #
+  # This merely requests a disconnect.  Omegle will then stop issuing events,
+  # which will cause any calls to get_event to return nil, which will in turn
+  # cause listen to quit.
   def disconnect
     ret = req('disconnect', "id=#{@id}")
     @id = nil if ret != nil
     parse_response(ret)
   end
 
+  # :category: Status
+  #
   # Is this object in a session?
   def connected?
     @id != nil
   end
 
+  # :category: Status
+  #
   # Is spy mode on?
   def spy_mode?
     @options[:question] != nil
   end
 
+  # :category: Status
+  #
   # Does this session have any topics associated?
   def topics
     @options[:topics]
   end
 
+  # :category: Events
+  #
   # Pass a code block to deal with each events as they come.
+  #
+  # This continually returns events until the omegle session is
+  # disconnected, and is the main way of interacting with the thing.
   def listen
     # Get any events since last call
     poll_events
@@ -150,10 +214,32 @@ class Omegle
     #
     # This drops out when no events are
     # available, and automatically polls for more
-    while (e = @events.pop) != nil
+    while (get_event) != nil
       yield e
       poll_events if @events.length == 0
     end
+  end
+
+  # :category: Events
+  #
+  # Returns the oldest event from the FIFO
+  #
+  # This, unlike #peek_event removes the event from the list.
+  def get_event
+    @mx.synchronize{
+      return @events.pop
+    } 
+  end
+
+  # :category: Events
+  #
+  # Returns a reference to the oldest event on the FIFO.
+  #
+  # Unlike #get_event this does not remove it from the list.
+  def peek_event
+    @mx.synchronize{
+      return @events.last
+    }
   end
 
   private
@@ -175,6 +261,10 @@ class Omegle
   # set args = :get to make a get request, else it's post.
   #
   # Returns the body if it worked, or nil if it failed.
+  #
+  # Arguments:
+  #   path: The page to request, without trailing or preceeding slash (i.e. 'status' for 'omegle.com/status')
+  #   args: A list of URI-formatted arguments, or the :get symbol
   def req(path, args="")
     omegle = Net::HTTP.start(@options[:host])
 
